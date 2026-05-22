@@ -78,6 +78,7 @@ _SSL_CONTEXT = ssl._create_unverified_context() if ALLOW_UNVERIFIED_OFFICIAL_SSL
 # 前端進度用：讓使用者知道目前計算到哪、還要多久。
 JOBS: Dict[str, Dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
+JOB_RETENTION_SECONDS = int(os.environ.get("BINGO_JOB_RETENTION_SECONDS", "21600"))
 
 def _job_update(job_id: str, percent: int, stage: str, detail: str = "", **extra: Any) -> None:
     with JOBS_LOCK:
@@ -93,6 +94,18 @@ def _job_update(job_id: str, percent: int, stage: str, detail: str = "", **extra
 def _job_get(job_id: str) -> Dict[str, Any]:
     with JOBS_LOCK:
         return dict(JOBS.get(job_id, {}))
+
+def _cleanup_jobs(now: Optional[float] = None) -> None:
+    now = now or time.time()
+    with JOBS_LOCK:
+        expired = []
+        for job_id, job in JOBS.items():
+            updated = float(job.get("updated_at") or job.get("created_at") or now)
+            max_age = JOB_RETENTION_SECONDS if job.get("done") else JOB_RETENTION_SECONDS * 2
+            if now - updated > max_age:
+                expired.append(job_id)
+        for job_id in expired:
+            JOBS.pop(job_id, None)
 
 def _estimate_seconds(record_count: int, sims: int) -> float:
     # 保守估算：資料讀取 + 權重 + 回測。不同電腦速度會不同，所以顯示為預估。
@@ -1860,6 +1873,95 @@ function showProgress(percent, text){
   document.getElementById('progressText').textContent=text;
 }
 function hideProgressSoon(){ setTimeout(()=>{document.getElementById('progressWrap').style.display='none';}, 1200); }
+const ACTIVE_JOB_KEY='bingo_active_job_v1';
+let resumeTimer=null;
+function saveActiveJob(jobId, payload){
+  try{ localStorage.setItem(ACTIVE_JOB_KEY, JSON.stringify({jobId,payload,startedAt:Date.now()})); }catch(e){}
+}
+function loadActiveJob(){
+  try{ return JSON.parse(localStorage.getItem(ACTIVE_JOB_KEY) || 'null'); }catch(e){ return null; }
+}
+function clearActiveJob(){
+  try{ localStorage.removeItem(ACTIVE_JOB_KEY); }catch(e){}
+}
+function renderPickResult(payload, res, elapsed){
+  renderBalls(res.numbers);
+  document.getElementById('hit').textContent=res.backtest.hit_rate+'%';
+  document.getElementById('ge2').textContent=res.backtest.ge2_rate+'%';
+  document.getElementById('ge3').textContent=res.backtest.ge3_rate+'%';
+  document.getElementById('avg').textContent=res.backtest.avg_hits;
+  document.getElementById('ret').textContent=res.backtest.return_rate+'%';
+  document.getElementById('lose').textContent=res.backtest.max_losing_streak;
+  renderDistribution(res.backtest.hit_distribution || {});
+  const rb=res.backtest.random_baseline || {};
+  const vrh=res.backtest.vs_random_hit_rate || 0;
+  const vrr=res.backtest.vs_random_return_rate || 0;
+  const lb=res.lookback_used ? `統計週期：近 ${res.lookback_used} 期` : '';
+  const payoutText=res.payout ? `獎金表：${res.payout.source || '未同步｜官方基準表'}` : '';
+  document.getElementById('baselineBox').innerHTML=`
+    <div class="baselineHeader">這次結果和隨機選號相比</div>
+    <div class="baselineGrid">
+      <div class="baselineCard">
+        <div class="k">隨機選號</div>
+        <div class="v">至少中1顆 ${rb.hit_rate}%<br>中3顆以上 ${rb.ge3_rate}%<br>回收率 ${rb.return_rate}%</div>
+      </div>
+      <div class="baselineCard">
+        <div class="k">這次策略</div>
+        <div class="v">命中率 ${vrh>=0?'+':''}${vrh}%<br>回收率 ${vrr>=0?'+':''}${vrr}%</div>
+      </div>
+    </div>
+    <div class="baselineMeta">${lb}${lb && payoutText ? '｜' : ''}${payoutText}</div>`;
+  if(res.payout){
+    const pSource = res.payout.source || '未同步｜官方基準表';
+    const pBet = res.payout.bet_amount || 25;
+    const pState = res.payout.ok ? '｜已同步' : '';
+    document.getElementById('infoPayout').textContent=`${pSource}｜每注 ${pBet} 元${pState}`;
+  }
+  const sources=(res.sources || []).join('、');
+  document.querySelector('#status span:last-child').textContent=`計算完成：使用官方資料 ${res.records} 筆；來源：${sources}${lb}`;
+  document.getElementById('infoSources').textContent=sources || '--';
+  document.getElementById('infoRecords').textContent=String(res.records || '--');
+  document.getElementById('infoSummary').textContent=`計算完成｜${payload.strategy || res.strategy || ''}｜${payload.count || (res.numbers || []).length}顆${lb}`;
+  showProgress(100, `完成｜共耗時 ${elapsed} 秒`);
+  hideProgressSoon();
+}
+function resumeActiveJob(){
+  const saved=loadActiveJob();
+  if(!saved || !saved.jobId) return;
+  const st=document.querySelector('#status span:last-child');
+  st.textContent='偵測到尚未取回的計算任務，正在接回進度...';
+  document.getElementById('infoSummary').textContent='正在接回背景任務';
+  showProgress(3,'接回背景任務...');
+  if(resumeTimer) clearInterval(resumeTimer);
+  const startedAt=saved.startedAt || Date.now();
+  const payload=saved.payload || {};
+  resumeTimer=setInterval(async()=>{
+    try{
+      const r=await fetch('/pick/status/'+saved.jobId);
+      const j=await r.json();
+      const elapsed=Math.max(1, Math.round((Date.now()-startedAt)/1000));
+      if(!r.ok || !j.ok){
+        clearInterval(resumeTimer);
+        resumeTimer=null;
+        clearActiveJob();
+        st.textContent=j.message || '背景任務已不存在，請重新開始選號。';
+        document.getElementById('infoSummary').textContent='背景任務已結束';
+        return;
+      }
+      const percent=Number(j.percent || 0);
+      showProgress(percent, `${j.stage || '計算中'} ${j.detail || ''}｜已耗時 ${elapsed} 秒`);
+      st.textContent=j.stage || '計算中...';
+      document.getElementById('infoSummary').textContent=(j.stage || '計算中...') + (j.detail ? `｜${j.detail}` : '');
+      if(j.done){
+        clearInterval(resumeTimer);
+        resumeTimer=null;
+        clearActiveJob();
+        if(!j.ok){ st.textContent=j.message || '計算失敗'; document.getElementById('infoSummary').textContent='計算失敗'; setErrorPlaceholders(); showProgress(100, j.message || '計算失敗'); return; }
+        renderPickResult(payload, j.result, elapsed);
+      }
+    }catch(e){}
+  }, 1000);
+}
 async function pick(){
   setQuickTags();
   const payload={
@@ -1878,6 +1980,7 @@ async function pick(){
   const started=await startResp.json();
   if(!started.ok){ st.textContent=started.message || '建立任務失敗'; document.getElementById('infoSummary').textContent='建立任務失敗'; setErrorPlaceholders(); showProgress(0, started.message || '建立任務失敗'); return; }
   const jobId=started.job_id;
+  saveActiveJob(jobId,payload);
   const startedAt=Date.now();
   const timer=setInterval(async()=>{
     const r=await fetch('/pick/status/'+jobId);
@@ -1896,7 +1999,8 @@ async function pick(){
     document.getElementById('infoSummary').textContent=(j.stage || '計算中...') + (j.detail ? `｜${j.detail}` : '');
     if(j.done){
       clearInterval(timer);
-      if(!j.ok){ st.textContent=j.message || '計算失敗'; document.getElementById('infoSummary').textContent='計算失敗'; setErrorPlaceholders(); showProgress(100, j.message || '計算失敗'); return; }
+      if(!j.ok){ clearActiveJob(); st.textContent=j.message || '計算失敗'; document.getElementById('infoSummary').textContent='計算失敗'; setErrorPlaceholders(); showProgress(100, j.message || '計算失敗'); return; }
+      clearActiveJob();
       const res=j.result;
       renderBalls(res.numbers);
       document.getElementById('hit').textContent=res.backtest.hit_rate+'%';
@@ -1939,7 +2043,7 @@ async function pick(){
     }
   }, 350);
 }
-window.addEventListener('load', ()=>{ setQuickTags(); setIdlePlaceholders(); loadDataStatus(); });
+window.addEventListener('load', async()=>{ setQuickTags(); setIdlePlaceholders(); await loadDataStatus(); resumeActiveJob(); });
 document.getElementById('strategy').addEventListener('change', setQuickTags);
 document.getElementById('range').addEventListener('change', setQuickTags);
 document.getElementById('lookback').addEventListener('change', setQuickTags);
@@ -2101,6 +2205,7 @@ def sync_route():
 
 @app.route("/pick/start", methods=["POST"])
 def pick_start():
+    _cleanup_jobs()
     payload = request.get_json(silent=True) or {}
     job_id = uuid.uuid4().hex
     with JOBS_LOCK:
@@ -2121,6 +2226,7 @@ def pick_start():
 
 @app.route("/pick/status/<job_id>")
 def pick_status(job_id: str):
+    _cleanup_jobs()
     job = _job_get(job_id)
     if not job:
         return jsonify({"ok": False, "done": True, "percent": 100, "stage": "找不到任務", "message": "任務不存在或已清除"}), 404
