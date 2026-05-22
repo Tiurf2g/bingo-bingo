@@ -79,6 +79,9 @@ _SSL_CONTEXT = ssl._create_unverified_context() if ALLOW_UNVERIFIED_OFFICIAL_SSL
 JOBS: Dict[str, Dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 JOB_RETENTION_SECONDS = int(os.environ.get("BINGO_JOB_RETENTION_SECONDS", "21600"))
+ANALYSIS_CACHE: Dict[Any, Any] = {}
+ANALYSIS_CACHE_LOCK = threading.Lock()
+ANALYSIS_CACHE_MAX = int(os.environ.get("BINGO_ANALYSIS_CACHE_MAX", "80"))
 
 def _job_update(job_id: str, percent: int, stage: str, detail: str = "", **extra: Any) -> None:
     with JOBS_LOCK:
@@ -110,6 +113,37 @@ def _cleanup_jobs(now: Optional[float] = None) -> None:
 def _estimate_seconds(record_count: int, sims: int) -> float:
     # 保守估算：資料讀取 + 權重 + 回測。不同電腦速度會不同，所以顯示為預估。
     return max(2.0, min(60.0, 1.2 + (min(max(record_count, 1), 5000) * min(max(sims, 30), 10000)) / 520000.0))
+
+def _stable_jitter(n: int, strategy: str, lookback: int, scale: float) -> float:
+    seed = sum(ord(c) for c in strategy) + int(lookback or 0) * 131 + int(n) * 7919
+    return ((seed * 1103515245 + 12345) % 10000) / 10000.0 * scale
+
+def _analysis_cache_get(key: Any) -> Any:
+    with ANALYSIS_CACHE_LOCK:
+        value = ANALYSIS_CACHE.get(key)
+        if value is not None:
+            ANALYSIS_CACHE[key] = value
+        return value
+
+def _analysis_cache_set(key: Any, value: Any) -> None:
+    with ANALYSIS_CACHE_LOCK:
+        if len(ANALYSIS_CACHE) >= ANALYSIS_CACHE_MAX:
+            try:
+                ANALYSIS_CACHE.pop(next(iter(ANALYSIS_CACHE)))
+            except Exception:
+                ANALYSIS_CACHE.clear()
+        ANALYSIS_CACHE[key] = value
+
+def _data_signature(data: List[List[int]]) -> Tuple[Any, ...]:
+    if not data:
+        return (0,)
+    anchors = []
+    for row in (data[:2] + data[-3:]):
+        anchors.append(tuple(int(n) for n in row[:20]))
+    return (len(data), tuple(anchors))
+
+def _payout_signature(table: Dict[int, Dict[int, int]]) -> Tuple[Any, ...]:
+    return tuple((int(k), tuple(sorted((int(h), int(v)) for h, v in row.items()))) for k, row in sorted(table.items()))
 
 
 def _log(msg: str) -> None:
@@ -914,13 +948,69 @@ def build_scores(data: List[List[int]], strategy: str = "平衡型", lookback: i
             score = freq_score * 0.38 + recent_score * 0.42 + trend_score * 0.12 + (1 - miss_score) * 0.08
         elif strategy == "逆向型":
             # 偏冷號與遺漏值，但保留一點近期趨勢，避免完全賭冷。
-            score = (1 - freq_score) * 0.26 + (1 - recent_score) * 0.22 + miss_score * 0.38 + trend_score * 0.09 + random.random() * 0.05
+            score = (1 - freq_score) * 0.26 + (1 - recent_score) * 0.22 + miss_score * 0.38 + trend_score * 0.09 + _stable_jitter(n, strategy, lookback, 0.05)
         else:
             # 平衡型：熱度、趨勢、遺漏值都看，少量隨機避免每次完全固定。
-            score = freq_score * 0.26 + recent_score * 0.31 + miss_score * 0.22 + trend_score * 0.14 + random.random() * 0.07
+            score = freq_score * 0.26 + recent_score * 0.31 + miss_score * 0.22 + trend_score * 0.14 + _stable_jitter(n, strategy, lookback, 0.07)
 
         scores[n] = max(score, 0.0001)
 
+    return scores
+
+
+def _build_scores_from_counts(total_counts: List[int], recent: List[Tuple[int, ...]], strategy: str, lookback: int) -> Dict[int, float]:
+    if strategy == "純隨機":
+        return {i: 1.0 for i in range(1, 81)}
+    if not recent:
+        return {i: 1.0 for i in range(1, 81)}
+
+    recent_counts = [0] * 81
+    first_half = [0] * 81
+    second_half = [0] * 81
+    mid = max(1, len(recent) // 2)
+    for row in recent[:mid]:
+        for n in row:
+            if 1 <= n <= 80:
+                recent_counts[n] += 1
+                first_half[n] += 1
+    for row in recent[mid:]:
+        for n in row:
+            if 1 <= n <= 80:
+                recent_counts[n] += 1
+                second_half[n] += 1
+
+    miss = [len(recent) + 1] * 81
+    missing_target = len(recent) + 1
+    remaining = 80
+    for idx, row in enumerate(reversed(recent), start=1):
+        for n in row:
+            if 1 <= n <= 80 and miss[n] == missing_target:
+                miss[n] = idx
+                remaining -= 1
+        if remaining <= 0:
+            break
+
+    max_long = max(max(total_counts[1:]), 1)
+    max_recent = max(max(recent_counts[1:]), 1)
+    max_miss = max(max(miss[1:]), 1)
+    max_trend_abs = max(max(abs(second_half[n] - first_half[n]) for n in range(1, 81)), 1)
+
+    scores = {}
+    for n in range(1, 81):
+        freq_score = total_counts[n] / max_long
+        recent_score = recent_counts[n] / max_recent
+        miss_score = miss[n] / max_miss
+        trend_raw = second_half[n] - first_half[n]
+        trend_score = 0.5 + (trend_raw / max_trend_abs / 2 if max_trend_abs else 0)
+        trend_score = max(0.0, min(1.0, trend_score))
+
+        if strategy == "保守型":
+            score = freq_score * 0.38 + recent_score * 0.42 + trend_score * 0.12 + (1 - miss_score) * 0.08
+        elif strategy == "逆向型":
+            score = (1 - freq_score) * 0.26 + (1 - recent_score) * 0.22 + miss_score * 0.38 + trend_score * 0.09 + _stable_jitter(n, strategy, lookback, 0.05)
+        else:
+            score = freq_score * 0.26 + recent_score * 0.31 + miss_score * 0.22 + trend_score * 0.14 + _stable_jitter(n, strategy, lookback, 0.07)
+        scores[n] = max(score, 0.0001)
     return scores
 
 
@@ -958,7 +1048,7 @@ def _pick_balanced_from_candidates(candidates: List[int], scores: Dict[int, floa
                 penalty += base * 0.10
 
             # 小幅隨機只用來打破同分，不讓結果每次完全死板。
-            final = base - penalty + random.random() * 0.002
+            final = base - penalty + _stable_jitter(n, "pick", len(picked) + count, 0.002)
             if final > best_score:
                 best_score = final
                 best_n = n
@@ -1317,6 +1407,12 @@ def theoretical_random_baseline(count: int, payout_table: Optional[Dict[int, Dic
 
 def backtest(data: List[List[int]], count: int, strategy: str, sims: int = 300, lookback: int = 300, number_range: str = "1-80", progress_cb=None, payout_table: Optional[Dict[int, Dict[int, int]]] = None) -> Dict[str, Any]:
     table = payout_table or get_payout_table(force=False)
+    cache_key = ("backtest", _data_signature(data), int(count), str(strategy), int(sims), int(lookback or 0), str(number_range), _payout_signature(table))
+    cached = _analysis_cache_get(cache_key)
+    if cached is not None:
+        if progress_cb:
+            progress_cb(1, 1)
+        return dict(cached)
     if len(data) < 50:
         base = theoretical_random_baseline(count, payout_table=table)
         return {
@@ -1327,6 +1423,12 @@ def backtest(data: List[List[int]], count: int, strategy: str, sims: int = 300, 
 
     rounds = min(max(30, sims), max(30, len(data) - 30))
     start = max(20, len(data) - rounds)
+    rows = [tuple(int(n) for n in row[:20]) for row in data]
+    total_counts = [0] * 81
+    for row in rows[:start]:
+        for n in row:
+            if 1 <= n <= 80:
+                total_counts[n] += 1
     hits_list: List[int] = []
     total_return = 0
     bet = 25
@@ -1337,12 +1439,12 @@ def backtest(data: List[List[int]], count: int, strategy: str, sims: int = 300, 
     for idx, i in enumerate(range(start, len(data)), start=1):
         if progress_cb and (idx == 1 or idx == total_rounds or idx % max(1, total_rounds // 20) == 0):
             progress_cb(idx, total_rounds)
-        train = data[:i]
-        actual = set(data[i])
+        actual = set(rows[i])
         if strategy == "純隨機":
             scores = {n: 1.0 for n in range(1, 81)}
         else:
-            scores = build_scores(train, strategy=strategy, lookback=lookback)
+            recent = rows[max(0, i - int(lookback or 0)):i] if lookback else rows[:i]
+            scores = _build_scores_from_counts(total_counts, recent, strategy=strategy, lookback=lookback)
         picked = set(pick_numbers(scores, count, number_range=number_range))
         hit = len(picked & actual)
         hits_list.append(hit)
@@ -1353,6 +1455,9 @@ def backtest(data: List[List[int]], count: int, strategy: str, sims: int = 300, 
             max_losing = max(max_losing, losing)
         else:
             losing = 0
+        for n in rows[i]:
+            if 1 <= n <= 80:
+                total_counts[n] += 1
 
     any_hit_rate = sum(1 for h in hits_list if h > 0) / len(hits_list) * 100 if hits_list else 0
     ge2_rate = sum(1 for h in hits_list if h >= 2) / len(hits_list) * 100 if hits_list else 0
@@ -1363,7 +1468,7 @@ def backtest(data: List[List[int]], count: int, strategy: str, sims: int = 300, 
     hit_distribution = {str(i): round(dist_counter.get(i, 0) / len(hits_list) * 100, 2) for i in range(0, count + 1)} if hits_list else {}
     baseline = theoretical_random_baseline(count, payout_table=table)
 
-    return {
+    result = {
         "hit_rate": round(any_hit_rate, 2),
         "ge2_rate": round(ge2_rate, 2),
         "ge3_rate": round(ge3_rate, 2),
@@ -1376,6 +1481,8 @@ def backtest(data: List[List[int]], count: int, strategy: str, sims: int = 300, 
         "vs_random_hit_rate": round(any_hit_rate - baseline.get("hit_rate", 0), 2),
         "vs_random_return_rate": round(return_rate - baseline.get("return_rate", 0), 2),
     }
+    _analysis_cache_set(cache_key, dict(result))
+    return result
 
 
 def optimize_lookback(data: List[List[int]], count: int, strategy: str, number_range: str = "1-80", progress_cb=None) -> Dict[str, Any]:
@@ -1383,6 +1490,12 @@ def optimize_lookback(data: List[List[int]], count: int, strategy: str, number_r
     用較短的快速回測找比較適合的統計週期。
     目的不是曲線擬合，而是避免固定 300 期在不同資料量下失真。
     """
+    cache_key = ("lookback", _data_signature(data), int(count), str(strategy), str(number_range))
+    cached = _analysis_cache_get(cache_key)
+    if cached is not None:
+        if progress_cb:
+            progress_cb(1, 1, cached.get("best_lookback", 300))
+        return dict(cached)
     candidates = [50, 100, 300, 500, 1000]
     candidates = [x for x in candidates if len(data) >= max(60, x // 2)] or [300]
     quick_sims = min(120, max(30, len(data) - 30))
@@ -1392,12 +1505,30 @@ def optimize_lookback(data: List[List[int]], count: int, strategy: str, number_r
         if progress_cb:
             progress_cb(idx, total, lb)
         bt = backtest(data, count=count, strategy=strategy, sims=quick_sims, lookback=lb, number_range=number_range)
-        # 排序分數：回收率優先，其次中3+比例、平均命中，再看是否高於隨機。
-        score = bt.get("return_rate", 0) * 0.50 + bt.get("ge3_rate", 0) * 0.22 + bt.get("avg_hits", 0) * 10 * 0.18 + bt.get("vs_random_hit_rate", 0) * 0.10
+        # 排序分數：看相對隨機基準的歷史驗證，並懲罰長連敗，避免只挑短期漂亮數字。
+        score = (
+            bt.get("vs_random_return_rate", 0) * 0.45
+            + bt.get("vs_random_hit_rate", 0) * 0.25
+            + bt.get("ge3_rate", 0) * 0.20
+            + bt.get("avg_hits", 0) * 5 * 0.10
+            - bt.get("max_losing_streak", 0) * 0.18
+        )
         results.append({"lookback": lb, "score": round(score, 4), "backtest": bt})
     results.sort(key=lambda x: x["score"], reverse=True)
     best = results[0] if results else {"lookback": 300, "score": 0, "backtest": {}}
-    return {"best_lookback": best["lookback"], "results": results, "quick_sims": quick_sims}
+    best_bt = best.get("backtest", {})
+    return_edge = best_bt.get("vs_random_return_rate", 0)
+    hit_edge = best_bt.get("vs_random_hit_rate", 0)
+    confidence = "positive" if return_edge >= 2 and hit_edge >= 0 else ("weak" if return_edge > 0 or hit_edge > 0 else "neutral")
+    result = {
+        "best_lookback": best["lookback"],
+        "results": results,
+        "quick_sims": quick_sims,
+        "confidence": confidence,
+        "honest_note": "若歷史驗證沒有明顯勝過隨機，系統會標示為中性，不宣稱有預測優勢。",
+    }
+    _analysis_cache_set(cache_key, dict(result))
+    return result
 
 HTML = r"""
 <!doctype html>
@@ -1884,6 +2015,13 @@ function loadActiveJob(){
 function clearActiveJob(){
   try{ localStorage.removeItem(ACTIVE_JOB_KEY); }catch(e){}
 }
+function validationLabel(info){
+  const c=info && info.confidence ? info.confidence : '';
+  if(c==='positive') return '歷史驗證：正向';
+  if(c==='weak') return '歷史驗證：微弱';
+  if(c==='neutral') return '歷史驗證：中性';
+  return '';
+}
 function renderPickResult(payload, res, elapsed){
   renderBalls(res.numbers);
   document.getElementById('hit').textContent=res.backtest.hit_rate+'%';
@@ -1897,6 +2035,7 @@ function renderPickResult(payload, res, elapsed){
   const vrh=res.backtest.vs_random_hit_rate || 0;
   const vrr=res.backtest.vs_random_return_rate || 0;
   const lb=res.lookback_used ? `統計週期：近 ${res.lookback_used} 期` : '';
+  const validation=validationLabel(res.lookback_info);
   const payoutText=res.payout ? `獎金表：${res.payout.source || '未同步｜官方基準表'}` : '';
   document.getElementById('baselineBox').innerHTML=`
     <div class="baselineHeader">這次結果和隨機選號相比</div>
@@ -1910,7 +2049,7 @@ function renderPickResult(payload, res, elapsed){
         <div class="v">命中率 ${vrh>=0?'+':''}${vrh}%<br>回收率 ${vrr>=0?'+':''}${vrr}%</div>
       </div>
     </div>
-    <div class="baselineMeta">${lb}${lb && payoutText ? '｜' : ''}${payoutText}</div>`;
+    <div class="baselineMeta">${lb}${lb && validation ? '｜' : ''}${validation}${(lb || validation) && payoutText ? '｜' : ''}${payoutText}</div>`;
   if(res.payout){
     const pSource = res.payout.source || '未同步｜官方基準表';
     const pBet = res.payout.bet_amount || 25;
@@ -1921,7 +2060,7 @@ function renderPickResult(payload, res, elapsed){
   document.querySelector('#status span:last-child').textContent=`計算完成：使用官方資料 ${res.records} 筆；來源：${sources}${lb}`;
   document.getElementById('infoSources').textContent=sources || '--';
   document.getElementById('infoRecords').textContent=String(res.records || '--');
-  document.getElementById('infoSummary').textContent=`計算完成｜${payload.strategy || res.strategy || ''}｜${payload.count || (res.numbers || []).length}顆${lb}`;
+  document.getElementById('infoSummary').textContent=`計算完成｜${payload.strategy || res.strategy || ''}｜${payload.count || (res.numbers || []).length}顆${lb}${validation ? '｜' + validation : ''}`;
   showProgress(100, `完成｜共耗時 ${elapsed} 秒`);
   hideProgressSoon();
 }
@@ -2014,6 +2153,7 @@ async function pick(){
       const vrh=res.backtest.vs_random_hit_rate || 0;
       const vrr=res.backtest.vs_random_return_rate || 0;
       const lb=res.lookback_used ? `統計週期：近 ${res.lookback_used} 期` : '';
+      const validation=validationLabel(res.lookback_info);
       const payoutText=res.payout ? `獎金表：${res.payout.source || '未同步｜官方基準表'}` : '';
       document.getElementById('baselineBox').innerHTML=`
         <div class="baselineHeader">這次結果和隨機選號相比</div>
@@ -2027,7 +2167,7 @@ async function pick(){
             <div class="v">命中率 ${vrh>=0?'+':''}${vrh}%<br>回收率 ${vrr>=0?'+':''}${vrr}%</div>
           </div>
         </div>
-        <div class="baselineMeta">${lb}${lb && payoutText ? '｜' : ''}${payoutText}</div>`;
+        <div class="baselineMeta">${lb}${lb && validation ? '｜' : ''}${validation}${(lb || validation) && payoutText ? '｜' : ''}${payoutText}</div>`;
       if(res.payout){
         const pSource = res.payout.source || '未同步｜官方基準表';
         const pBet = res.payout.bet_amount || 25;
@@ -2037,7 +2177,7 @@ async function pick(){
       st.textContent=`計算完成：使用官方資料 ${res.records} 筆；來源：${res.sources.join('、')}${lb}`;
       document.getElementById('infoSources').textContent=res.sources.join('、') || '--';
       document.getElementById('infoRecords').textContent=String(res.records || '--');
-      document.getElementById('infoSummary').textContent=`計算完成｜${payload.strategy}｜${payload.count}顆${lb}`;
+      document.getElementById('infoSummary').textContent=`計算完成｜${payload.strategy}｜${payload.count}顆${lb}${validation ? '｜' + validation : ''}`;
       showProgress(100, `完成｜共耗時 ${elapsed} 秒`);
       hideProgressSoon();
     }
