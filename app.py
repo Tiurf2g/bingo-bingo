@@ -118,6 +118,15 @@ def _stable_jitter(n: int, strategy: str, lookback: int, scale: float) -> float:
     seed = sum(ord(c) for c in strategy) + int(lookback or 0) * 131 + int(n) * 7919
     return ((seed * 1103515245 + 12345) % 10000) / 10000.0 * scale
 
+def _seed_value(seed: Any) -> int:
+    if seed is None:
+        return random.SystemRandom().randint(1, 2**31 - 1)
+    text = str(seed)
+    value = 0
+    for ch in text:
+        value = (value * 131 + ord(ch)) % (2**31 - 1)
+    return value or 1
+
 def _analysis_cache_get(key: Any) -> Any:
     with ANALYSIS_CACHE_LOCK:
         value = ANALYSIS_CACHE.get(key)
@@ -1019,11 +1028,32 @@ def _bucket_of_number(n: int) -> int:
     return min(3, max(0, (int(n) - 1) // 20))
 
 
-def _pick_balanced_from_candidates(candidates: List[int], scores: Dict[int, float], count: int) -> List[int]:
+def _weighted_seeded_candidates(ranked: List[int], scores: Dict[int, float], count: int, seed: Any) -> List[int]:
+    rng = random.Random(_seed_value(seed))
+    pool_size = min(len(ranked), max(28, count * 8))
+    pool = ranked[:pool_size]
+    selected: List[int] = []
+    while pool and len(selected) < min(len(pool), max(20, count * 5)):
+        weights = [max(float(scores.get(n, 0.0001)), 0.0001) ** 1.25 for n in pool]
+        total = sum(weights)
+        roll = rng.random() * total
+        acc = 0.0
+        chosen_idx = 0
+        for idx, weight in enumerate(weights):
+            acc += weight
+            if roll <= acc:
+                chosen_idx = idx
+                break
+        selected.append(pool.pop(chosen_idx))
+    return selected or ranked[:max(20, count * 5)]
+
+
+def _pick_balanced_from_candidates(candidates: List[int], scores: Dict[int, float], count: int, seed: Any = None) -> List[int]:
     """從候選池中貪婪挑選，加入區間、奇偶、尾數與距離分散，避免組合太偏。"""
     picked: List[int] = []
     count = min(count, len(candidates))
     target_bucket = max(1, math.ceil(count / 4))
+    seed_offset = _seed_value(seed) % 997 if seed is not None else 0
 
     while len(picked) < count:
         best_n = None
@@ -1048,7 +1078,7 @@ def _pick_balanced_from_candidates(candidates: List[int], scores: Dict[int, floa
                 penalty += base * 0.10
 
             # 小幅隨機只用來打破同分，不讓結果每次完全死板。
-            final = base - penalty + _stable_jitter(n, "pick", len(picked) + count, 0.002)
+            final = base - penalty + _stable_jitter(n, "pick", len(picked) + count + seed_offset, 0.002)
             if final > best_score:
                 best_score = final
                 best_n = n
@@ -1059,7 +1089,7 @@ def _pick_balanced_from_candidates(candidates: List[int], scores: Dict[int, floa
     return sorted(picked)
 
 
-def pick_numbers(scores: Dict[int, float], count: int, number_range: str = "1-80") -> List[int]:
+def pick_numbers(scores: Dict[int, float], count: int, number_range: str = "1-80", seed: Any = None) -> List[int]:
     if number_range == "1-40":
         allowed = list(range(1, 41))
     elif number_range == "41-80":
@@ -1076,13 +1106,13 @@ def pick_numbers(scores: Dict[int, float], count: int, number_range: str = "1-80
 
     # 純隨機基準：所有權重相同時，不做候選池平衡，保持真正隨機。
     if max(values) - min(values) < 1e-12:
-        return sorted(random.sample(nums, count))
+        rng = random.Random(_seed_value(seed)) if seed is not None else random
+        return sorted(rng.sample(nums, count))
 
     # 候選池 + 平衡挑選：先取高分候選，再做區間/奇偶/尾數分散。
     ranked = sorted(nums, key=lambda n: scores.get(n, 0), reverse=True)
-    pool_size = min(len(ranked), max(20, count * 5))
-    candidates = ranked[:pool_size]
-    return _pick_balanced_from_candidates(candidates, scores, count)
+    candidates = _weighted_seeded_candidates(ranked, scores, count, seed) if seed is not None else ranked[:min(len(ranked), max(20, count * 5))]
+    return _pick_balanced_from_candidates(candidates, scores, count, seed=seed)
 
 # BINGO BINGO 基本玩法獎金表：以每注 25 元計算。
 # key = 選號數量, value = {命中顆數: 獎金}
@@ -2245,7 +2275,7 @@ def _run_pick_job(job_id: str, payload: Dict[str, Any]) -> None:
             pct = 42 + int(56 * done / max(1, total))
             _job_update(job_id, pct, "回測中", f"{done}/{total} 次｜統計週期：近 {lookback} 期", eta_seconds=eta)
 
-        nums = pick_numbers(scores, count=count, number_range=number_range)
+        nums = pick_numbers(scores, count=count, number_range=number_range, seed=f"{job_id}:{time.time_ns()}")
         bt = backtest(data, count=count, strategy=strategy, sims=sims, lookback=lookback, number_range=number_range, progress_cb=cb, payout_table=payout_table)
 
         result = {
@@ -2397,7 +2427,7 @@ def pick():
             lookback = int(opt["best_lookback"])
 
         scores = build_scores(data, strategy=strategy, lookback=lookback)
-        nums = pick_numbers(scores, count=count, number_range=number_range)
+        nums = pick_numbers(scores, count=count, number_range=number_range, seed=time.time_ns())
         payout_summary = get_payout_summary(force=False)
         payout_table = get_payout_table(force=False)
         bt = backtest(data, count=count, strategy=strategy, sims=sims, lookback=lookback, number_range=number_range, payout_table=payout_table)
