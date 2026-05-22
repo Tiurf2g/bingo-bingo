@@ -2,7 +2,12 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
-official_cache/
+official_cache/*
+!official_cache/
+!official_cache/*.zip
+!official_cache/bingobingo_history.json
+!official_cache/official_resource_index.json
+!official_cache/official_state.json
 build/
 dist/
 *.spec

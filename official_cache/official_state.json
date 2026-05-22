@@ -1,0 +1,16 @@
+{
+  "updated_at": "2026-05-22T08:07:24",
+  "record_count": 24360,
+  "resources": [
+    {
+      "year": 115,
+      "url": "https://cdn.taiwanlottery.com.tw/app/FilesForDownload/Download/LottoResult/2026.zip",
+      "file_name": "各期彩券獎號、銷售金額與獎金總額",
+      "cache_file": "official_115_各期彩券獎號、銷售金額與獎金總額.zip",
+      "size": 789526
+    }
+  ],
+  "sources": [
+    "C:\\Users\\V002811\\Documents\\Codex\\AI工具\\bingo-deploy\\official_cache\\official_115_各期彩券獎號、銷售金額與獎金總額.zip"
+  ]
+}

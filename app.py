@@ -318,7 +318,13 @@ def download_resource(item: Dict[str, Any], force: bool = False) -> Path:
     if out.exists() and out.stat().st_size > 100 and not force:
         return out
 
-    data = _request(url, timeout=60)
+    try:
+        data = _request(url, timeout=60)
+    except Exception:
+        if out.exists() and out.stat().st_size > 100:
+            _log(f"官方檔案下載失敗，改用內建快取：{out.name}")
+            return out
+        raise
 
     # 嘗試從 Content-Disposition 取檔名不做了，保持穩定
     out.write_bytes(data)
@@ -719,6 +725,20 @@ def sync_official_data(force: bool = False) -> Dict[str, Any]:
                 }
         except Exception:
             pass
+
+    if force and os.environ.get("BINGO_BUNDLED_CACHE_FIRST", "1").lower() not in {"0", "false", "no"}:
+        cache = _read_history_payload()
+        if cache and cache.get("records"):
+            return {
+                "ok": True,
+                "from_cache": True,
+                "records": cache["records"],
+                "record_count": len(cache["records"]),
+                "message": f"使用內建官方快取：{len(cache['records'])} 筆",
+                "sources": cache.get("sources", []),
+                "resources": cache.get("resources", []),
+                "updated_at": cache.get("updated_at"),
+            }
 
     last_errors = []
     _log("官方開獎資料同步中...")
