@@ -1,0 +1,37 @@
+name: Update official Bingo data
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 08:30 Asia/Taipei every day.
+    - cron: "30 0 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  update-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Update official cache
+        env:
+          BINGO_BUNDLED_CACHE_FIRST: "0"
+          BINGO_FORCE_IPV4: "1"
+        run: python scripts/update_official_cache.py
+
+      - name: Commit cache changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Update official Bingo data cache"
+          file_pattern: "official_cache/*.json official_cache/*.zip"
