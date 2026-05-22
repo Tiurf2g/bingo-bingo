@@ -141,6 +141,11 @@ def _safe_filename(name: str) -> str:
     return name[:180]
 
 
+def _source_display_name(source: Any) -> str:
+    text = str(source or "").replace("\\", "/")
+    return text.rsplit("/", 1)[-1] if text else ""
+
+
 def _clean_url(url: str) -> str:
     """清理從 HTML/JSON 片段抓到的網址，避免 <br、換行、逗號等尾巴被當成 URL。"""
     url = html.unescape(str(url or "").strip())
@@ -409,7 +414,7 @@ def get_local_cache_summary() -> Dict[str, Any]:
         "record_count": len(payload.get("records", [])),
         "updated_at": payload.get("updated_at"),
         "cached_year": cached_year,
-        "sources": [Path(str(s)).name for s in sources],
+        "sources": [_source_display_name(s) for s in sources],
         "resources": resources,
         "message": f"已載入官方資料 {len(payload.get('records', []))} 筆，可直接開始選號。",
     }
@@ -2009,7 +2014,7 @@ def _run_pick_job(job_id: str, payload: Dict[str, Any]) -> None:
             "lookback_used": lookback,
             "lookback_auto": lookback_raw == "auto",
             "lookback_info": lookback_info,
-            "sources": [Path(s).name for s in sync_result.get("sources", [])],
+            "sources": [_source_display_name(s) for s in sync_result.get("sources", [])],
             "payout": payout_summary,
             "backtest": bt,
         }
@@ -2080,7 +2085,7 @@ def sync_route():
             "message": result["message"],
             "records": result["record_count"],
             "from_cache": result["from_cache"],
-            "sources": [Path(s).name for s in result.get("sources", [])],
+            "sources": [_source_display_name(s) for s in result.get("sources", [])],
             "updated_at": result.get("updated_at"),
             "cached_year": get_local_cache_summary().get("cached_year"),
             "payout": payout,
@@ -2161,7 +2166,7 @@ def pick():
             "lookback_used": lookback,
             "lookback_auto": lookback_raw == "auto",
             "lookback_info": opt,
-            "sources": [Path(s).name for s in sync_result.get("sources", [])],
+            "sources": [_source_display_name(s) for s in sync_result.get("sources", [])],
             "payout": payout_summary,
             "backtest": bt,
         })
